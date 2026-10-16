@@ -439,7 +439,7 @@
     </section>
 
   </div>
-  <footer class="book-footer">存股手帳 · 資料僅儲存在這台裝置的瀏覽器中，供個人試算使用 · 市價：台灣證交所（即時，可用時）／FinMind（收盤價）· 股利：FinMind</footer>
+  <footer class="book-footer">存股手帳 · 資料僅儲存在這台裝置的瀏覽器中，供個人試算使用 · 市價：台灣證交所（盤中即時）／FinMind（收盤價）· 股利：FinMind</footer>
 </div>
 
 <script>
@@ -530,7 +530,8 @@
   // fetch() 都會被瀏覽器擋下（伺服器其實有回應 200，但瀏覽器不讓網頁程式讀取內容）。
   // 這裡改成「先直連，被 CORS 擋下就自動改走公開代理伺服器」。代理是第三方免費服務，
   // 穩定性不保證（可能較慢、可能偶爾掛掉），是務實的權宜之計，不是完美解法。
-  var CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+  // 自架的 Cloudflare Worker 代理（只轉送證交所即時報價），取代已失效的公共代理 allorigins。
+  var CORS_PROXY = 'https://cungu-proxy.astraeus1129.workers.dev/?url=';
 
   // 加上逾時：免費代理掛掉時常常是「完全不回應」，沒有逾時的話按鈕會一直卡在「查詢中…」。
   function fetchWithTimeout(url, ms){
@@ -564,19 +565,31 @@
   // 若代號查無資料或連線被部署環境擋下，一律回傳 null，讓畫面退回手動輸入。
   function guessCategoryFromSymbol(symbol){ return /^00/.test(symbol) ? 'ETF' : '股票'; }
 
-  // 證交所即時報價：只能經由第三方 CORS 代理取得，代理不穩，所以只當作「加分項」，最多等幾秒。
+  // 證交所即時報價：經由自架代理取得。
+  // 注意：撮合空檔時「成交價 z」常會是 '-'，這時不能拿昨收 y 頂替（會顯示錯的價格），
+  // 改用當下最佳一檔買價與賣價的中間價；兩者都沒有才放棄即時價，交給 FinMind 收盤價。
+  function firstLevel(s){ var v = parseFloat(String(s||'').split('_')[0]); return v>0 ? v : null; }
+
   async function lookupTwseRealtime(symbol){
     var url = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_'+encodeURIComponent(symbol)+'.tw|otc_'+encodeURIComponent(symbol)+'.tw&json=1&delay=0&_='+Date.now();
-    var data = await fetchJsonWithLogging(url, 'TWSE即時', { directTimeout: 3000, proxyTimeout: 5000 });
-    if(data && data.msgArray && data.msgArray.length>0){
-      for(var i=0;i<data.msgArray.length;i++){
-        var item = data.msgArray[i];
-        var price = parseFloat(item.z && item.z !== '-' ? item.z : item.y);
-        var name = item.n || item.nf || '';
-        if(name || (price && price>0)){
-          return { name: name || symbol, price: (price && price>0) ? price : null, time: item.t || '' };
-        }
-      }
+    var data = null;
+    try{
+      var res = await fetchWithTimeout(CORS_PROXY + encodeURIComponent(url), 6000);
+      console.log('[存股手帳] 查詢 TWSE即時（代理） → HTTP狀態:', res.status);
+      if(res.ok) data = await res.json();
+    }catch(e){ console.warn('[存股手帳] TWSE即時 查詢失敗:', e); }
+    if(!data || !data.msgArray) return null;
+    for(var i=0;i<data.msgArray.length;i++){
+      var item = data.msgArray[i];
+      var name = item.n || item.nf || '';
+      if(!name) continue;                       // tse_/otc_ 只有一個會有資料
+      var trade = parseFloat(item.z);
+      var bid = firstLevel(item.b), ask = firstLevel(item.a);
+      var price = null, kind = '';
+      if(trade > 0){ price = trade; kind = '成交價'; }
+      else if(bid && ask){ price = Math.round((bid+ask)/2*100)/100; kind = '買賣中價'; }
+      else if(bid || ask){ price = bid || ask; kind = bid ? '委買價' : '委賣價'; }
+      return { name: name, price: price, kind: kind, time: (item.t||'').slice(0,5) };
     }
     return null;
   }
@@ -614,7 +627,7 @@
       name: (fm && fm.name) || (rt && rt.name) || symbol,
       category: fm ? fm.category : guessCategoryFromSymbol(symbol),
       price: useRt ? rt.price : (fm ? fm.price : null),
-      priceLabel: useRt ? nowLabel()+'・即時' : (fm && fm.asOf ? fm.asOf.slice(5).replace('-','/')+' 收盤價' : nowLabel())
+      priceLabel: useRt ? (rt.time || nowLabel().slice(0,5))+' 即時'+rt.kind : (fm && fm.asOf ? fm.asOf.slice(5).replace('-','/')+' 收盤價' : nowLabel())
     };
   }
 
